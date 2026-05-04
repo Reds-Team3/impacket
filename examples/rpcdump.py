@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+"""
+Standalone DCE/RPC endpoint mapper dumper.
+No impacket dependency — all protocol logic implemented from scratch.
+Supports port 135 (ncacn_ip_tcp) only.
+"""
+
 from __future__ import print_function
 
 import sys
@@ -9,13 +16,12 @@ import logging
 import getpass
 
 # ---------------------------------------------------------------------------
-# Logging setup
+# Logging
 # ---------------------------------------------------------------------------
 
 def init_logger(add_ts=False, debug=False):
     level = logging.DEBUG if debug else logging.INFO
-    fmt = '%(asctime)s ' if add_ts else ''
-    fmt += '%(levelname)s: %(message)s'
+    fmt = ('%(asctime)s ' if add_ts else '') + '%(levelname)s: %(message)s'
     logging.basicConfig(level=level, format=fmt)
 
 
@@ -34,19 +40,18 @@ MSRPC_FAULT         = 3
 
 PFC_FIRST_FRAG      = 0x01
 PFC_LAST_FRAG       = 0x02
-REPRESENTATION_LE   = 0x10   # little-endian, ASCII
+REPRESENTATION_LE   = 0x10
 
-# EPM interface
 EPMAPPER_UUID        = 'e1af8308-5d1f-11c9-91a4-08002b14a0fa'
 EPMAPPER_VERSION     = 3
 EPMAPPER_VERSION_MIN = 0
 
-# NDR transfer syntax
 NDR_UUID    = '8a885d04-1ceb-11c9-9fe8-08002b104860'
 NDR_VERSION = 2
 
-EPT_LOOKUP  = 2   # ept_lookup opnum
+EPT_LOOKUP  = 2
 MAX_ENTRIES = 500
+ANNOTATION_SIZE = 64
 
 
 # ---------------------------------------------------------------------------
@@ -54,79 +59,54 @@ MAX_ENTRIES = 500
 # ---------------------------------------------------------------------------
 
 def pack_uuid_bytes(uuid_str):
-    """UUID string → 16-byte DCE wire format (bytes_le)."""
     return _uuid_mod.UUID(uuid_str).bytes_le
 
 
 def unpack_uuid_bytes(data, offset=0):
-    """16 bytes of DCE wire UUID (bytes_le) → UUID string."""
-    raw = data[offset:offset + 16]
+    raw = bytes(data[offset:offset + 16])
     if len(raw) != 16:
-        raise ValueError(
-            "Need 16 bytes for UUID, got %d (offset=%d, buf_len=%d)"
-            % (len(raw), offset, len(data))
-        )
-    return str(_uuid_mod.UUID(bytes_le=bytes(raw)))
+        raise ValueError("Need 16 bytes for UUID, got %d (offset=%d buf_len=%d)"
+                         % (len(raw), offset, len(data)))
+    return str(_uuid_mod.UUID(bytes_le=raw))
 
 
 # ---------------------------------------------------------------------------
-# DCE/RPC PDU helpers
+# PDU building
 # ---------------------------------------------------------------------------
 
 def build_common_header(ptype, frag_len, call_id, flags=PFC_FIRST_FRAG | PFC_LAST_FRAG):
-    """16-byte DCE/RPC common header."""
     return bytes([
-        MSRPC_VERSION,          # rpc_vers
-        MSRPC_MINOR_VERSION,    # rpc_vers_minor
-        ptype,                  # PTYPE
-        flags,                  # pfc_flags
-        REPRESENTATION_LE,      # packed_drep[0]: byte order + charset
-        0x00,                   # packed_drep[1]: float format
-        0x00,                   # packed_drep[2]: reserved
-        0x00,                   # packed_drep[3]: reserved
+        MSRPC_VERSION, MSRPC_MINOR_VERSION, ptype, flags,
+        REPRESENTATION_LE, 0x00, 0x00, 0x00,
     ]) + struct.pack('<HHI', frag_len, 0, call_id)
-    #                frag_len  auth_len  call_id
 
 
 def build_bind_pdu(call_id=1):
-    """MSRPC BIND PDU: bind to EPM interface with NDR transfer syntax."""
-    epm_uuid_b = pack_uuid_bytes(EPMAPPER_UUID)
-    ndr_uuid_b = pack_uuid_bytes(NDR_UUID)
-
-    # p_syntax_id (interface): uuid(16) + ver_major(2) + ver_minor(2)
-    if_id = epm_uuid_b + struct.pack('<HH', EPMAPPER_VERSION, EPMAPPER_VERSION_MIN)
-    # transfer syntax: uuid(16) + version(2) + minor(2)
-    xfer  = ndr_uuid_b + struct.pack('<HH', NDR_VERSION, 0)
-
-    # p_cont_list: num_contexts(2) + reserved(2) + [ctx_id(2) + num_xfer_syn(2) + if_id(20) + xfer(20)]
-    p_context_elem = struct.pack('<HH', 1, 0) + struct.pack('<HH', 0, 1) + if_id + xfer
-
-    # BIND body: max_xmit(2) + max_recv(2) + assoc_group(4) + p_context_elem
-    bind_body = struct.pack('<HHI', 4280, 4280, 0) + p_context_elem
-
-    frag_len = 16 + len(bind_body)
-    return build_common_header(MSRPC_BIND, frag_len, call_id) + bind_body
+    epm_if   = pack_uuid_bytes(EPMAPPER_UUID) + struct.pack('<HH', EPMAPPER_VERSION, EPMAPPER_VERSION_MIN)
+    ndr_xfer = pack_uuid_bytes(NDR_UUID)      + struct.pack('<HH', NDR_VERSION, 0)
+    # p_cont_list: num_contexts(2) + reserved(2) + ctx_id(2) + num_xfer(2) + if(20) + xfer(20)
+    p_cont = struct.pack('<HH', 1, 0) + struct.pack('<HH', 0, 1) + epm_if + ndr_xfer
+    # BIND body: max_xmit(2) + max_recv(2) + assoc_group(4) + p_cont
+    body = struct.pack('<HHI', 4280, 4280, 0) + p_cont
+    frag_len = 16 + len(body)
+    return build_common_header(MSRPC_BIND, frag_len, call_id) + body
 
 
 def parse_bind_ack(data):
-    """Parse BIND_ACK; raise on rejection or wrong PDU type."""
     if len(data) < 16:
-        raise ValueError("BIND_ACK too short (%d bytes)" % len(data))
+        raise ValueError("BIND_ACK too short")
     ptype = data[2]
     if ptype == MSRPC_FAULT:
         status = struct.unpack_from('<I', data, 16)[0] if len(data) >= 20 else 0
-        raise RuntimeError("BIND fault, status=0x%08x" % status)
+        raise RuntimeError("BIND fault 0x%08x" % status)
     if ptype != MSRPC_BIND_ACK:
-        raise RuntimeError("Expected BIND_ACK (12), got ptype=%d" % ptype)
-    # secondary_addr_len at offset 24 (2 bytes), then the addr string
+        raise RuntimeError("Expected BIND_ACK(12) got ptype=%d" % ptype)
     if len(data) < 26:
-        raise ValueError("BIND_ACK too short for secondary_addr")
+        raise ValueError("BIND_ACK too short for sec_addr")
     sec_addr_len = struct.unpack_from('<H', data, 24)[0]
-    # skip to p_results, 4-byte aligned after secondary_addr
-    offset = 26 + sec_addr_len
-    offset = (offset + 3) & ~3
+    offset = (26 + sec_addr_len + 3) & ~3   # 4-byte align
     if offset + 4 > len(data):
-        raise ValueError("BIND_ACK too short for p_results")
+        raise ValueError("BIND_ACK too short for p_results (offset=%d len=%d)" % (offset, len(data)))
     num_results = struct.unpack_from('<H', data, offset)[0]
     offset += 4
     for _ in range(num_results):
@@ -135,155 +115,127 @@ def parse_bind_ack(data):
         result = struct.unpack_from('<H', data, offset)[0]
         if result == 0:
             return True
-        offset += 24   # result(2)+reason(2)+transfer_syntax(20)
-    raise RuntimeError("All p_context items rejected in BIND_ACK")
+        offset += 24
+    raise RuntimeError("All bind contexts rejected")
 
 
 def build_request_pdu(call_id, opnum, stub_data):
-    """MSRPC REQUEST PDU."""
     # alloc_hint(4) + p_context_id(2) + opnum(2)
-    req_hdr = struct.pack('<IHH', len(stub_data), 0, opnum)
-    body = req_hdr + stub_data
+    body = struct.pack('<IHH', len(stub_data), 0, opnum) + stub_data
     frag_len = 16 + len(body)
     return build_common_header(MSRPC_REQUEST, frag_len, call_id) + body
 
 
 # ---------------------------------------------------------------------------
-# NDR: ept_lookup request encoding
+# ept_lookup NDR encoding
 # ---------------------------------------------------------------------------
 
 def build_ept_lookup_request(entry_handle_bytes=None):
     """
-    NDR-encode ept_lookup() call:
-        inquiry_type = RPC_C_EP_ALL_ELTS (0)
-        object       = NULL pointer
-        interface_id = NULL pointer
-        vers_option  = 0
-        entry_handle = 20-byte context handle
-        max_ents     = MAX_ENTRIES
+    NDR encoding of ept_lookup() in-parameters.
+
+    Wire layout (all LE):
+      inquiry_type  : UINT32 = 0  (RPC_C_EP_ALL_ELTS)
+      object_ptr    : UINT32 = 0  (NULL unique pointer)
+      if_id_ptr     : UINT32 = 0  (NULL unique pointer)
+      vers_option   : UINT32 = 0
+      entry_handle  : 20 bytes    (context handle, zeros = start of enumeration)
+      max_ents      : UINT32
     """
     if entry_handle_bytes is None:
         entry_handle_bytes = b'\x00' * 20
-
     return (
-        struct.pack('<I', 0)               # inquiry_type = 0
-        + struct.pack('<I', 0)             # *object = NULL
-        + struct.pack('<I', 0)             # *interface_id = NULL
-        + struct.pack('<I', 0)             # vers_option = 0
-        + bytes(entry_handle_bytes)        # entry_handle (20 bytes)
-        + struct.pack('<I', MAX_ENTRIES)   # max_ents
+        struct.pack('<I', 0)              # inquiry_type
+        + struct.pack('<I', 0)            # *object  = NULL
+        + struct.pack('<I', 0)            # *if_id   = NULL
+        + struct.pack('<I', 0)            # vers_option
+        + bytes(entry_handle_bytes)       # entry_handle (20 bytes)
+        + struct.pack('<I', MAX_ENTRIES)  # max_ents
     )
 
 
 # ---------------------------------------------------------------------------
-# NDR: ept_lookup response decoding
+# ept_lookup NDR response decoding
 #
-# Wire layout of ept_entry_t (NDR-encoded):
-#   object        : UUID (16 bytes, bytes_le)
-#   tower         : unique pointer (4-byte referent ID)
-#   annotation    : char[64]  ← FIXED SIZE, NOT a conformant string!
+# ept_entry_t on the wire (NDR, per MS-RPCE / C706):
+#   object        16 bytes  (UUID bytes_le)
+#   tower_ptr      4 bytes  (unique pointer referent ID, 0 = NULL)
+#   annotation    64 bytes  (fixed char[64], NOT a conformant string)
 #
-# The entries array is conformant:
-#   max_count (4 bytes) precedes the array elements.
+# The array is conformant: max_count (4 bytes) precedes the elements.
+# After all elements, deferred tower blobs appear in order (one per
+# non-NULL tower_ptr):
+#   tower_max_count  4 bytes  (total byte length of tower)
+#   tower_length     4 bytes  (same value again — conformant array)
+#   floor_data       tower_length bytes
 #
-# After the entries array, deferred tower data is appended for each
-# non-NULL tower pointer (conformant blob: max_count(4) + tower_len(4)
-# + floor data).
-#
-# After all deferred data:
-#   num_ents (4 bytes)   ← actual count returned
-#   status   (4 bytes)
+# After all deferred blobs:
+#   num_ents   4 bytes  (actual entries returned this call)
+#   status     4 bytes
 # ---------------------------------------------------------------------------
 
-ANNOTATION_SIZE = 64  # char annotation[64]
-
-
-def _align4(offset):
-    return (offset + 3) & ~3
+def _align4(n):
+    return (n + 3) & ~3
 
 
 def parse_ept_lookup_response(stub):
-    """
-    Parse NDR stub data of ept_lookup response.
-
-    Returns: (entry_handle_bytes, entries_list, status_code)
-    Each entry: {'object_uuid': str, 'annotation': str, 'tower_floors': list}
-    """
     offset = 0
 
-    # ── entry_handle: 20-byte context handle ──────────────────────────────
-    if len(stub) < offset + 20:
-        raise ValueError("stub too short for entry_handle")
-    entry_handle = stub[offset:offset + 20]
-    offset += 20
+    def read(n, what=''):
+        nonlocal offset
+        if offset + n > len(stub):
+            raise ValueError("stub too short for %s: need offset+%d=%d, have %d"
+                             % (what, n, offset + n, len(stub)))
+        chunk = stub[offset:offset + n]
+        offset += n
+        return chunk
 
-    # ── num_ents: actual count returned (unsigned32) ───────────────────────
-    if len(stub) < offset + 4:
-        raise ValueError("stub too short for num_ents")
-    num_ents = struct.unpack_from('<I', stub, offset)[0]
-    offset += 4
+    def read_u32(what=''):
+        return struct.unpack('<I', read(4, what))[0]
 
-    # ── conformant array: max_count ───────────────────────────────────────
-    if len(stub) < offset + 4:
-        raise ValueError("stub too short for max_count")
-    max_count = struct.unpack_from('<I', stub, offset)[0]
-    offset += 4
+    # entry_handle (20 bytes)
+    entry_handle = read(20, 'entry_handle')
 
-    # ── array elements (fixed-layout, no deferred data in-line) ───────────
-    # Each ept_entry_t element on the wire:
-    #   object UUID : 16 bytes
-    #   tower ptr   :  4 bytes (referent or 0)
-    #   annotation  : 64 bytes (fixed char array)
-    entries_raw = []
-    for _ in range(max_count):
-        if len(stub) < offset + 16 + 4 + ANNOTATION_SIZE:
-            break
+    # num_ents
+    num_ents = read_u32('num_ents')
 
-        obj_uuid = unpack_uuid_bytes(stub, offset)
-        offset += 16
+    # conformant array max_count
+    max_count = read_u32('max_count')
 
-        tower_referent = struct.unpack_from('<I', stub, offset)[0]
-        offset += 4
+    logging.debug("parse_ept_lookup_response: num_ents=%d max_count=%d stub_len=%d"
+                  % (num_ents, max_count, len(stub)))
 
-        raw_ann = stub[offset:offset + ANNOTATION_SIZE]
-        offset += ANNOTATION_SIZE
-        try:
-            annotation = raw_ann.rstrip(b'\x00').decode('utf-8', errors='replace')
-        except Exception:
-            annotation = ''
-
-        entries_raw.append({
-            'object_uuid':     obj_uuid,
-            'annotation':      annotation,
-            'tower_referent':  tower_referent,
-            'tower_floors':    [],
+    entries = []
+    for i in range(max_count):
+        obj_uuid      = unpack_uuid_bytes(read(16, 'obj_uuid[%d]' % i))
+        tower_ref     = read_u32('tower_ref[%d]' % i)
+        raw_ann       = read(ANNOTATION_SIZE, 'annotation[%d]' % i)
+        annotation    = raw_ann.rstrip(b'\x00').decode('utf-8', errors='replace')
+        entries.append({
+            'object_uuid':    obj_uuid,
+            'annotation':     annotation,
+            'tower_referent': tower_ref,
+            'tower_floors':   [],
         })
 
-    # ── deferred tower data: one blob per non-NULL referent ───────────────
-    for entry in entries_raw:
+    # deferred tower blobs
+    for entry in entries:
         if entry['tower_referent'] == 0:
             continue
-        if len(stub) < offset + 8:
-            break
-        # conformant blob: max_count(4) = total byte length
-        tower_max = struct.unpack_from('<I', stub, offset)[0]
-        offset += 4
-        # actual length field (repeated in some implementations)
-        tower_len = struct.unpack_from('<I', stub, offset)[0]
-        offset += 4
-        if len(stub) < offset + tower_len:
-            tower_len = len(stub) - offset   # clamp rather than crash
-        tower_bytes = stub[offset:offset + tower_len]
-        offset += tower_len
-        # towers are NOT 4-byte-aligned between entries in standard EPM
+        # conformant blob header: max_count(4) + actual_count(4)
+        tower_max = read_u32('tower_max')
+        tower_len = read_u32('tower_len')
+        logging.debug("  tower blob: max=%d len=%d at offset=%d" % (tower_max, tower_len, offset))
+        tower_bytes = read(tower_len, 'tower_bytes')
         entry['tower_floors'] = parse_tower(tower_bytes)
 
-    # ── trailing status (last 4 bytes) ────────────────────────────────────
+    # trailing status
     status = 0
-    if len(stub) >= offset + 4:
+    if offset + 4 <= len(stub):
         status = struct.unpack_from('<I', stub, offset)[0]
+    logging.debug("  status=0x%08x remaining_bytes=%d" % (status, len(stub) - offset - 4))
 
-    return entry_handle, entries_raw[:num_ents], status
+    return entry_handle, entries[:num_ents], status
 
 
 # ---------------------------------------------------------------------------
@@ -292,21 +244,11 @@ def parse_ept_lookup_response(stub):
 
 def parse_tower(data):
     """
-    Parse a DCE/RPC protocol tower.
+    DCE/RPC protocol tower → list of floor dicts.
 
-    Tower wire format:
-        num_floors  (2 bytes, LE)
-        [floor]*    each floor:
-            lhs_len (2 bytes, LE)
-            lhs      (lhs_len bytes) — protocol ID + optional UUID + versions
-            rhs_len (2 bytes, LE)
-            rhs      (rhs_len bytes) — port, address, pipe name …
-
-    Floor 0: protocol_id=0x0d, lhs = [0x0d][16-byte UUID][2-byte ver][2-byte ver_minor]
-    Floor 1: protocol_id=0x0d, lhs = [0x0d][16-byte NDR UUID][2-byte ver][2-byte ver_minor]
-    Floor 2: transport protocol (0x07=ncacn_ip_tcp, 0x08=ncadg_ip_udp, 0x0f=ncacn_np …)
-    Floor 3: address (IP, pipe, …)
-    Floor 4: (sometimes) port
+    Floor LHS layout:
+      Floor 0+1: [1-byte proto_id=0x0d][16-byte UUID][2-byte ver][2-byte ver_minor]
+      Floor 2+:  [1-byte proto_id][optional protocol-specific data]
     """
     if len(data) < 2:
         return []
@@ -316,56 +258,50 @@ def parse_tower(data):
     for _ in range(num_floors):
         if offset + 2 > len(data):
             break
-        lhs_len = struct.unpack_from('<H', data, offset)[0]
-        offset += 2
+        lhs_len = struct.unpack_from('<H', data, offset)[0]; offset += 2
         if offset + lhs_len > len(data):
             break
-        lhs = data[offset:offset + lhs_len]
-        offset += lhs_len
+        lhs = data[offset:offset + lhs_len]; offset += lhs_len
 
         if offset + 2 > len(data):
             break
-        rhs_len = struct.unpack_from('<H', data, offset)[0]
-        offset += 2
+        rhs_len = struct.unpack_from('<H', data, offset)[0]; offset += 2
         if offset + rhs_len > len(data):
             break
-        rhs = data[offset:offset + rhs_len]
-        offset += rhs_len
+        rhs = data[offset:offset + rhs_len]; offset += rhs_len
 
-        proto_id = lhs[0] if lhs else 0
-        floors.append({'lhs': lhs, 'rhs': rhs, 'protocol_id': proto_id})
+        floors.append({
+            'lhs':         lhs,
+            'rhs':         rhs,
+            'protocol_id': lhs[0] if lhs else 0,
+        })
     return floors
 
 
 def get_uuid_from_floor0(floors):
-    """
-    Extract the interface UUID from floor 0.
-
-    Floor 0 LHS layout: [1-byte proto_id=0x0d][16-byte UUID bytes_le][2+2 byte versions]
-    UUID starts at byte offset 1.
-    """
+    """Floor 0 LHS: [proto_id(1)][UUID(16)][ver(2)][ver_minor(2)] — UUID starts at byte 1."""
     if not floors:
         return None
     lhs = floors[0]['lhs']
-    if len(lhs) < 17:   # need at least proto_id(1) + UUID(16)
+    if len(lhs) < 17:
         return None
     try:
-        return unpack_uuid_bytes(lhs, 1)   # skip the 1-byte protocol identifier
+        return unpack_uuid_bytes(lhs, 1)
     except Exception:
         return None
 
 
 # ---------------------------------------------------------------------------
-# Binding string formatter
+# Known UUID tables
 # ---------------------------------------------------------------------------
 
-# Floor 2 protocol IDs → transport name
+# Floor 2 protocol_id → transport string
 TRANSPORT_PROTO = {
     0x07: 'ncacn_ip_tcp',
     0x08: 'ncadg_ip_udp',
     0x09: 'ncacn_nb_nb',
     0x0c: 'ncacn_spx',
-    0x0d: 'ncacn_ip_tcp',   # seen in some stacks
+    0x0d: 'ncacn_ip_tcp',
     0x0e: 'ncadg_ip_udp',
     0x0f: 'ncacn_np',
     0x10: 'ncacn_np',
@@ -374,7 +310,6 @@ TRANSPORT_PROTO = {
     0x04: 'ncacn_dnet_nsp',
 }
 
-# UUID (lowercase, without version) → human-readable name
 KNOWN_UUID_PROTOCOLS = {
     '6bffd098-a112-3610-9833-46c3f87e345a': 'Workstation Service',
     '4b112204-0e19-11d3-b42b-0000f81feb9f': 'Svcctl',
@@ -434,63 +369,44 @@ KNOWN_UUID_EXES = {
 }
 
 
-def floor_to_binding_string(floors):
-    """
-    Reconstruct a binding string from parsed tower floors.
+# ---------------------------------------------------------------------------
+# Binding string formatter
+# ---------------------------------------------------------------------------
 
-    Typical 5-floor TCP tower:
-      Floor 0: interface UUID + version
-      Floor 1: NDR transfer syntax
-      Floor 2: transport protocol (e.g. 0x07 = ncacn_ip_tcp)
-      Floor 3: IP address (4 bytes, big-endian)
-      Floor 4: TCP port (2 bytes, big-endian)
-    """
+def floor_to_binding_string(floors):
     if not floors:
         return 'N/A'
     try:
-        # Determine transport from floor 2
         proto_id = floors[2]['protocol_id'] if len(floors) > 2 else 0
-        proto    = TRANSPORT_PROTO.get(proto_id, 'unknown_proto(0x%02x)' % proto_id)
-
+        proto    = TRANSPORT_PROTO.get(proto_id, 'unknown(0x%02x)' % proto_id)
         parts = []
-        # Floors 3+ carry address info
         for fl in floors[3:]:
             rhs = fl['rhs']
             pid = fl['protocol_id']
-
-            if pid in (0x07, 0x0d):   # TCP port (big-endian 16-bit)
+            if pid in (0x07, 0x0d):      # TCP port (big-endian)
                 if len(rhs) >= 2:
-                    port = struct.unpack('>H', rhs[:2])[0]
-                    parts.append('[%d]' % port)
-            elif pid in (0x08, 0x0e): # UDP port
+                    parts.append('[%d]' % struct.unpack('>H', rhs[:2])[0])
+            elif pid in (0x08, 0x0e):    # UDP port
                 if len(rhs) >= 2:
-                    port = struct.unpack('>H', rhs[:2])[0]
-                    parts.append('[%d]' % port)
-            elif pid == 0x09:         # IP address (4 bytes)
+                    parts.append('[%d]' % struct.unpack('>H', rhs[:2])[0])
+            elif pid == 0x09:            # IPv4 address
                 if len(rhs) == 4:
                     parts.append('%d.%d.%d.%d' % tuple(rhs))
-            elif pid in (0x0f, 0x10): # named pipe
-                s = rhs.rstrip(b'\x00').decode('utf-8', errors='replace')
-                if s:
-                    parts.append('[%s]' % s)
-            elif pid == 0x11:         # ncalrpc endpoint name
+            elif pid in (0x0f, 0x10, 0x11, 0x1f):  # named pipe / lrpc / http
                 s = rhs.rstrip(b'\x00').decode('utf-8', errors='replace')
                 if s:
                     parts.append('[%s]' % s)
             else:
-                if rhs:
-                    s = rhs.rstrip(b'\x00').decode('utf-8', errors='replace')
-                    if s and s.isprintable():
-                        parts.append(s)
-
-        return proto + ':' + ''.join(parts) if parts else proto
-
+                s = rhs.rstrip(b'\x00').decode('utf-8', errors='replace')
+                if s and all(c.isprintable() for c in s):
+                    parts.append(s)
+        return (proto + ':' + ''.join(parts)) if parts else proto
     except Exception as ex:
         return 'parse_error(%s)' % ex
 
 
 # ---------------------------------------------------------------------------
-# Transport: raw TCP with PDU reassembly
+# TCP transport with raw PDU reassembly
 # ---------------------------------------------------------------------------
 
 class TCPTransport:
@@ -501,34 +417,62 @@ class TCPTransport:
         self._sock   = None
 
     def connect(self):
-        logging.debug("Connecting to %s:%d" % (self.host, self.port))
+        logging.debug("TCP connect → %s:%d" % (self.host, self.port))
         self._sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        # once connected, use a generous per-read timeout
+        self._sock.settimeout(self.timeout)
 
     def send(self, data):
+        logging.debug("send %d bytes" % len(data))
         self._sock.sendall(data)
 
     def recv_pdu(self):
-        """Read one complete MSRPC PDU, reassembling fragments."""
-        hdr  = self._recv_n(16)
-        flen = struct.unpack_from('<H', hdr, 8)[0]
-        pdu  = hdr + self._recv_n(flen - 16)
+        """
+        Read exactly one complete MSRPC PDU.
+        The 16-byte common header contains frag_length at bytes 8-9 (LE uint16).
+        We read the header first, then read exactly (frag_length - 16) more bytes.
+        If the PDU is fragmented (PFC_LAST_FRAG not set), append subsequent fragments.
+        """
+        hdr = self._recv_n(16)
+        logging.debug("recv hdr: %s" % hdr.hex())
 
+        frag_len = struct.unpack_from('<H', hdr, 8)[0]
+        logging.debug("frag_len=%d" % frag_len)
+
+        if frag_len < 16:
+            raise ValueError("Malformed PDU: frag_len=%d < 16" % frag_len)
+
+        body = self._recv_n(frag_len - 16)
+        pdu  = hdr + body
+
+        # Reassemble multi-fragment PDUs
         while not (pdu[3] & PFC_LAST_FRAG):
-            # read next fragment header + body
-            frag_hdr  = self._recv_n(16)
-            frag_flen = struct.unpack_from('<H', frag_hdr, 8)[0]
-            frag_body = self._recv_n(frag_flen - 16)
-            # skip per-fragment request header (8 bytes) before appending stub
-            pdu += frag_body[8:]
+            logging.debug("fragment, reading next PDU chunk")
+            fhdr  = self._recv_n(16)
+            fflen = struct.unpack_from('<H', fhdr, 8)[0]
+            fbody = self._recv_n(fflen - 16)
+            # Append only the stub portion (skip 8-byte per-fragment request header)
+            pdu += fbody[8:]
 
+        logging.debug("recv_pdu total=%d bytes ptype=%d" % (len(pdu), pdu[2]))
         return pdu
 
     def _recv_n(self, n):
+        if n == 0:
+            return b''
         buf = b''
         while len(buf) < n:
-            chunk = self._sock.recv(n - len(buf))
+            try:
+                chunk = self._sock.recv(n - len(buf))
+            except socket.timeout:
+                raise TimeoutError(
+                    "Timed out waiting for %d bytes (got %d so far). "
+                    "Server may have dropped the connection — check firewall rules for port 135 "
+                    "beyond initial TCP handshake (some firewalls allow SYN but drop data)."
+                    % (n, len(buf))
+                )
             if not chunk:
-                raise EOFError("Socket closed after %d/%d bytes" % (len(buf), n))
+                raise EOFError("Server closed connection after %d/%d bytes" % (len(buf), n))
             buf += chunk
         return buf
 
@@ -552,14 +496,15 @@ class EPMClient:
 
     def connect(self):
         self._transport.connect()
-        pdu = build_bind_pdu(call_id=self._call_id)
-        self._transport.send(pdu)
+        logging.debug("Sending BIND PDU")
+        self._transport.send(build_bind_pdu(call_id=self._call_id))
+        logging.debug("Waiting for BIND_ACK")
         resp = self._transport.recv_pdu()
         parse_bind_ack(resp)
+        logging.debug("BIND_ACK accepted")
         self._call_id += 1
 
     def lookup_all(self):
-        """Iteratively drain the endpoint mapper table."""
         all_entries  = []
         entry_handle = b'\x00' * 20
 
@@ -567,25 +512,25 @@ class EPMClient:
             stub = build_ept_lookup_request(entry_handle)
             req  = build_request_pdu(self._call_id, EPT_LOOKUP, stub)
             self._call_id += 1
+            logging.debug("Sending ept_lookup REQUEST (call_id=%d)" % (self._call_id - 1))
             self._transport.send(req)
             resp = self._transport.recv_pdu()
 
             ptype = resp[2]
             if ptype == MSRPC_FAULT:
                 status = struct.unpack_from('<I', resp, 24)[0] if len(resp) >= 28 else 0
-                raise RuntimeError("RPC_FAULT in ept_lookup: 0x%08x" % status)
+                raise RuntimeError("RPC_FAULT: 0x%08x" % status)
             if ptype != MSRPC_RESPONSE:
-                raise RuntimeError("Unexpected PDU type %d" % ptype)
+                raise RuntimeError("Unexpected PDU type %d (expected RESPONSE=2)" % ptype)
 
-            # Stub data starts after 16-byte common header +
-            # 8-byte response header (alloc_hint + p_context_id + cancel_count + reserved)
+            # Stub data: common header(16) + response header(alloc_hint(4)+ctx_id(2)+cancel_count(1)+reserved(1)) = 24
             stub_data = resp[24:]
-
-            entry_handle, entries, ept_status = parse_ept_lookup_response(stub_data)
+            entry_handle, entries, status = parse_ept_lookup_response(stub_data)
+            logging.debug("ept_lookup returned %d entries, status=0x%08x" % (len(entries), status))
             all_entries.extend(entries)
 
-            # 0x16c9a0d6 = EPT_S_NOT_REGISTERED (no more entries)
-            if ept_status != 0 or len(entries) == 0:
+            # EPT_S_NOT_REGISTERED (0x16c9a0d6) or any non-zero = done
+            if status != 0 or len(entries) == 0:
                 break
 
         return all_entries
@@ -595,7 +540,7 @@ class EPMClient:
 
 
 # ---------------------------------------------------------------------------
-# Main dump logic
+# RPCDump
 # ---------------------------------------------------------------------------
 
 class RPCDump:
@@ -610,7 +555,7 @@ class RPCDump:
         try:
             client.connect()
         except Exception as e:
-            logging.critical("Failed to connect to %s:%d — %s" % (remote_host, self._port, e))
+            logging.critical("Connection failed to %s:%d — %s" % (remote_host, self._port, e))
             return
 
         try:
@@ -625,12 +570,11 @@ class RPCDump:
             logging.info("No endpoints found.")
             return
 
-        # Group by interface UUID
         endpoints = {}
         for entry in entries:
-            floors   = entry.get('tower_floors', [])
-            if_uuid  = get_uuid_from_floor0(floors) or entry.get('object_uuid', 'unknown')
-            key      = if_uuid.lower()
+            floors  = entry.get('tower_floors', [])
+            if_uuid = get_uuid_from_floor0(floors) or entry.get('object_uuid', 'unknown')
+            key     = if_uuid.lower()
 
             if key not in endpoints:
                 endpoints[key] = {
@@ -640,11 +584,9 @@ class RPCDump:
                     'exe':        KNOWN_UUID_EXES.get(key, 'N/A'),
                     'protocol':   KNOWN_UUID_PROTOCOLS.get(key, 'N/A'),
                 }
-
             binding = floor_to_binding_string(floors)
             if binding not in endpoints[key]['bindings']:
                 endpoints[key]['bindings'].append(binding)
-
             if not endpoints[key]['annotation'] and entry.get('annotation'):
                 endpoints[key]['annotation'] = entry['annotation']
 
@@ -666,7 +608,6 @@ class RPCDump:
 # ---------------------------------------------------------------------------
 
 def parse_target(target):
-    """[[domain/]username[:password]@]<host> → (domain, user, pass, host)"""
     domain = username = password = ''
     if '@' in target:
         creds, host = target.rsplit('@', 1)
@@ -686,30 +627,14 @@ def main():
     print("=" * 50)
 
     parser = argparse.ArgumentParser(
-        add_help=True,
         description="Dumps remote RPC endpoints via epmapper (standalone, no impacket)."
     )
-    parser.add_argument(
-        'target', action='store',
-        help='[[domain/]username[:password]@]<targetName or address>'
-    )
-    parser.add_argument('-debug', action='store_true', help='Turn DEBUG output ON')
-    parser.add_argument('-ts',    action='store_true', help='Add timestamp to logging output')
-
-    conn = parser.add_argument_group('connection')
-    conn.add_argument(
-        '-target-ip', action='store', metavar='ip address',
-        help='IP address of target (useful when target is a NetBIOS name)'
-    )
-    conn.add_argument(
-        '-port', choices=['135'], nargs='?', default='135',
-        metavar='destination port',
-        help='Destination port (only 135/ncacn_ip_tcp supported in standalone mode)'
-    )
-    conn.add_argument(
-        '-timeout', action='store', type=int, default=10, metavar='seconds',
-        help='TCP connection timeout (default: 10)'
-    )
+    parser.add_argument('target', help='[[domain/]username[:password]@]<targetName or address>')
+    parser.add_argument('-debug',   action='store_true', help='Turn DEBUG output ON')
+    parser.add_argument('-ts',      action='store_true', help='Add timestamp to logging output')
+    parser.add_argument('-target-ip', metavar='ip', help='IP address of target')
+    parser.add_argument('-port',    choices=['135'], default='135', help='Destination port (135 only)')
+    parser.add_argument('-timeout', type=int, default=10, metavar='seconds', help='TCP timeout (default 10)')
 
     if len(sys.argv) == 1:
         parser.print_help()
@@ -718,15 +643,13 @@ def main():
     options = parser.parse_args()
     init_logger(add_ts=options.ts, debug=options.debug)
 
-    domain, username, password, remote_name = parse_target(options.target)
-
+    _, username, password, remote_name = parse_target(options.target)
     if password == '' and username != '':
         password = getpass.getpass("Password: ")
 
     remote_host = options.target_ip if options.target_ip else remote_name
 
-    dumper = RPCDump(port=int(options.port), timeout=options.timeout)
-    dumper.dump(remote_name, remote_host)
+    RPCDump(port=int(options.port), timeout=options.timeout).dump(remote_name, remote_host)
 
 
 if __name__ == '__main__':
