@@ -164,10 +164,20 @@ def build_ept_lookup_request(entry_handle_bytes=None):
 #
 # The array is conformant: max_count (4 bytes) precedes the elements.
 # After all elements, deferred tower blobs appear in order (one per
-# non-NULL tower_ptr):
-#   tower_max_count  4 bytes  (total byte length of tower)
-#   tower_length     4 bytes  (same value again — conformant array)
-#   floor_data       tower_length bytes
+# non-NULL tower_ptr).
+#
+# twr_t is a conformant struct (C706 Appendix L / MS-RPCE):
+#   typedef struct {
+#     unsigned32 tower_length;
+#     [size_is(tower_length)] byte tower_octet_string[];
+#   } twr_t;
+#
+# Because tower_length is the size_is attribute, it IS the NDR max_count,
+# so it appears exactly ONCE on the wire before the floor data:
+#   tower_length  4 bytes   (= NDR max_count for the conformant array)
+#   floor_data    tower_length bytes
+#
+# There is NO second length field. Reading two uint32s was wrong.
 #
 # After all deferred blobs:
 #   num_ents   4 bytes  (actual entries returned this call)
@@ -222,10 +232,10 @@ def parse_ept_lookup_response(stub):
     for entry in entries:
         if entry['tower_referent'] == 0:
             continue
-        # conformant blob header: max_count(4) + actual_count(4)
-        tower_max = read_u32('tower_max')
+        # twr_t conformant struct: tower_length(4) + tower_octet_string(tower_length)
+        # tower_length IS the NDR max_count — appears exactly once, not twice.
         tower_len = read_u32('tower_len')
-        logging.debug("  tower blob: max=%d len=%d at offset=%d" % (tower_max, tower_len, offset))
+        logging.debug("  tower blob: len=%d at offset=%d" % (tower_len, offset))
         tower_bytes = read(tower_len, 'tower_bytes')
         entry['tower_floors'] = parse_tower(tower_bytes)
 
@@ -428,33 +438,58 @@ class TCPTransport:
 
     def recv_pdu(self):
         """
-        Read exactly one complete MSRPC PDU.
-        The 16-byte common header contains frag_length at bytes 8-9 (LE uint16).
-        We read the header first, then read exactly (frag_length - 16) more bytes.
-        If the PDU is fragmented (PFC_LAST_FRAG not set), append subsequent fragments.
+        Read and reassemble one complete MSRPC PDU from potentially multiple fragments.
+
+        Each fragment is a self-contained PDU with its own 16-byte common header.
+        The 16-byte common header layout:
+          [0]  rpc_vers
+          [1]  rpc_vers_minor
+          [2]  PTYPE
+          [3]  pfc_flags   ← PFC_FIRST_FRAG=0x01, PFC_LAST_FRAG=0x02
+          [4:8] packed_drep
+          [8:10] frag_length   ← total bytes in THIS fragment including header
+          [10:12] auth_length
+          [12:16] call_id
+
+        For RESPONSE PDUs, after the 16-byte common header there is an 8-byte
+        response header: alloc_hint(4) + p_context_id(2) + cancel_count(1) + reserved(1).
+        Stub data begins at byte 24 of the first fragment.
+
+        Continuation fragments have the same 16+8 = 24-byte prefix before their
+        stub chunk. We keep the first fragment's full PDU (header+response_hdr+stub)
+        and append only the stub portions from subsequent fragments so that the
+        caller can always find stub data at pdu[24:].
         """
+        # Read first fragment
         hdr = self._recv_n(16)
         logging.debug("recv hdr: %s" % hdr.hex())
-
         frag_len = struct.unpack_from('<H', hdr, 8)[0]
-        logging.debug("frag_len=%d" % frag_len)
-
         if frag_len < 16:
-            raise ValueError("Malformed PDU: frag_len=%d < 16" % frag_len)
-
+            raise ValueError("Malformed PDU: frag_len=%d" % frag_len)
         body = self._recv_n(frag_len - 16)
         pdu  = hdr + body
 
-        # Reassemble multi-fragment PDUs
-        while not (pdu[3] & PFC_LAST_FRAG):
-            logging.debug("fragment, reading next PDU chunk")
-            fhdr  = self._recv_n(16)
-            fflen = struct.unpack_from('<H', fhdr, 8)[0]
-            fbody = self._recv_n(fflen - 16)
-            # Append only the stub portion (skip 8-byte per-fragment request header)
-            pdu += fbody[8:]
+        # flags from the CURRENT fragment (not the accumulated pdu)
+        cur_flags = hdr[3]
 
-        logging.debug("recv_pdu total=%d bytes ptype=%d" % (len(pdu), pdu[2]))
+        # Reassemble continuation fragments until PFC_LAST_FRAG is set
+        while not (cur_flags & PFC_LAST_FRAG):
+            logging.debug("fragment not last (flags=0x%02x), reading next" % cur_flags)
+            fhdr  = self._recv_n(16)
+            logging.debug("cont frag hdr: %s" % fhdr.hex())
+            fflen = struct.unpack_from('<H', fhdr, 8)[0]
+            if fflen < 16:
+                raise ValueError("Malformed continuation fragment: frag_len=%d" % fflen)
+            fbody     = self._recv_n(fflen - 16)
+            cur_flags = fhdr[3]
+            # Each continuation fragment has a 24-byte prefix (16 common + 8 response hdr).
+            # We only want the stub chunk; fbody already has 16 bytes stripped,
+            # so skip the remaining 8-byte response sub-header.
+            stub_chunk = fbody[8:]
+            pdu += stub_chunk
+            logging.debug("  appended %d stub bytes (flags=0x%02x)" % (len(stub_chunk), cur_flags))
+
+        logging.debug("recv_pdu complete: %d total bytes, ptype=%d" % (len(pdu), pdu[2]))
         return pdu
 
     def _recv_n(self, n):
